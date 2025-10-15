@@ -1,19 +1,3 @@
-/*
- * src/mini_shell.cpp
- * Implementación de una mini-shell POSIX/C++ que cumple los requisitos:
- * - Prompt propio
- * - Resolución de rutas: rutas absolutas usadas tal cual; si no, se intenta /bin/<cmd>
- * - fork() + exec*() en hijos; padre espera con wait/waitpid (foreground)
- * - mensajes de error en español usando perror/errno
- * - redirección de salida '>' (truncar/crear)
- * - comando 'salir' para terminar
- * - extensiones: pipe simple (cmd1 | cmd2) y background '&' (no bloquear)
- * - manejador de SIGINT en padre para no morir con Ctrl-C; hijos reciben señales normalmente
- * - instrumentación básica de memoria (contadores de malloc/free usados por la shell)
- *
- * Compilar: g++ -std=c++17 -pthread src/mini_shell.cpp -o mini_shell
- */
-
 #include <bits/stdc++.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -28,6 +12,10 @@
 #include "parser.h"
 
 using namespace std;
+
+vector<string> command_history;
+map<string, string> aliases;
+
 
 // ================= Instrumentación simple de memoria =================
 static size_t g_alloc_count = 0;
@@ -208,17 +196,126 @@ void setup_signal_handlers() {
         perror("sigaction");
 }
 
+// ================= Ejecución de comandos en paralelo =================
+void run_parallel(const vector<string>& args) {
+    vector<pthread_t> threads;
+    vector<string> comandos;
+
+    string concatenado;
+    for (size_t i = 1; i < args.size(); ++i) {
+        concatenado += args[i] + " ";
+    }
+
+    stringstream ss(concatenado);
+    string parte;
+    while (getline(ss, parte, ';')) {
+        string cmd = parte;
+        cmd.erase(0, cmd.find_first_not_of(" \t"));
+        cmd.erase(cmd.find_last_not_of(" \t") + 1);
+        if (!cmd.empty()) comandos.push_back(cmd);
+    }
+
+    // Crear un hilo por comando
+    for (auto &cmd : comandos) {
+        pthread_t tid;
+        pthread_create(&tid, nullptr, [](void* arg) -> void* {
+            string comando = *(string*)arg;
+            delete (string*)arg;
+
+            cout << "[HILO] Ejecutando: " << comando << endl;
+            int ret = system(comando.c_str());
+            if (ret == -1)
+                perror("system");
+            return nullptr;
+        }, new string(cmd));
+        threads.push_back(tid);
+    }
+
+    // Esperar a que terminen todos
+    for (auto& t : threads)
+        pthread_join(t, nullptr);
+
+    cout << "[HILO] Todos los comandos paralelos han finalizado.\n";
+}
+
+
+
+
+
 // ================= Ejecución de comando simple =================
 int execute_single(Command &cmd, bool background, const string& orig_cmdline) {
     if (cmd.args.empty()) return 0;
 
     // built-ins
-    if (cmd.args[0] == "salir") exit(0);
-    else if (cmd.args[0] == "jobs") { print_bgjobs(); return 0; }
+    if (cmd.args[0] == "salir") {
+        exit(0);
+    }
+    else if (cmd.args[0] == "jobs") {
+        print_bgjobs();
+        return 0;
+    }
     else if (cmd.args[0] == "meminfo") {
         cout << "Allocaciones activas (aprox): " << shell_alloc_count() << "\n";
         return 0;
     }
+    else if (cmd.args[0] == "cd") {
+        const char* path = (cmd.args.size() > 1) ? cmd.args[1].c_str() : getenv("HOME");
+        if (chdir(path) != 0) perror("cd");
+        return 0;
+    }
+    else if (cmd.args[0] == "pwd") {
+        char cwd[1024];
+        if (getcwd(cwd, sizeof(cwd)) != nullptr)
+            cout << cwd << "\n";
+        else
+            perror("pwd");
+        return 0;
+    }
+    else if (cmd.args[0] == "help") {
+        cout << "=== Comandos internos de mini-shell ===\n"
+            << "salir               - Termina la mini-shell\n"
+            << "cd [dir]            - Cambia el directorio actual\n"
+            << "pwd                 - Muestra el directorio actual\n"
+            << "jobs                - Lista procesos en background\n"
+            << "meminfo             - Muestra conteo de memoria\n"
+            << "help                - Muestra esta ayuda\n"
+            << "history             - Muestra comandos previos\n"
+            << "alias nombre=valor  - Crea un alias simple\n"
+            << "=========================================\n";
+        return 0;
+    }
+    else if (cmd.args[0] == "history") {
+        extern vector<string> command_history;
+        for (size_t i = 0; i < command_history.size(); ++i)
+            cout << setw(3) << i + 1 << "  " << command_history[i] << "\n";
+        return 0;
+    }
+    else if (cmd.args[0] == "alias") {
+        if (cmd.args.size() == 1) {
+            for (auto &p : aliases) cout << p.first << "='" << p.second << "'\n";
+        } else {
+            string expr = cmd.args[1];
+            size_t eq = expr.find('=');
+            if (eq != string::npos) {
+                string name = expr.substr(0, eq);
+                string val = expr.substr(eq + 1);
+                aliases[name] = val;
+                cout << "Alias creado: " << name << "='" << val << "'\n";
+            } else {
+                cerr << "Uso: alias nombre=valor\n";
+            }
+        }
+        return 0;
+    }
+    else if (cmd.args[0] == "parallel") {
+        if (cmd.args.size() < 2) {
+            cerr << "Uso: parallel \"comando1\" \"comando2\" ...\n";
+            return 0;
+        }
+        run_parallel(cmd.args);
+        return 0;
+    }
+
 
     char* exe_path = resolve_executable(cmd.args[0]);
     if (!exe_path) {
@@ -283,6 +380,85 @@ int execute_single(Command &cmd, bool background, const string& orig_cmdline) {
     }
 }
 
+// ================= Ejecución con pipe (cmd1 | cmd2) =================
+int execute_pipe(Command &cmd1, Command &cmd2, bool background, const string& orig_cmdline) {
+    int fd[2];
+    if (pipe(fd) == -1) {
+        perror("pipe");
+        return -1;
+    }
+
+    pid_t pid1 = fork();
+    if (pid1 == -1) {
+        perror("fork cmd1");
+        close(fd[0]);
+        close(fd[1]);
+        return -1;
+    }
+
+    if (pid1 == 0) {
+        close(fd[0]);
+        dup2(fd[1], STDOUT_FILENO);
+        close(fd[1]);
+
+        char* exe_path = resolve_executable(cmd1.args[0]);
+        if (!exe_path) {
+            cerr << "mini-shell: comando no encontrado: " << cmd1.args[0] << "\n";
+            _exit(127);
+        }
+
+        char** argv = make_argv(cmd1.args);
+        execv(exe_path, argv);
+        perror("execv cmd1");
+        free_argv(argv);
+        _exit(127);
+    }
+
+    pid_t pid2 = fork();
+    if (pid2 == -1) {
+        perror("fork cmd2");
+        close(fd[0]);
+        close(fd[1]);
+        return -1;
+    }
+
+    if (pid2 == 0) {
+        close(fd[1]);
+        dup2(fd[0], STDIN_FILENO);
+        close(fd[0]);
+
+        char* exe_path = resolve_executable(cmd2.args[0]);
+        if (!exe_path) {
+            cerr << "mini-shell: comando no encontrado: " << cmd2.args[0] << "\n";
+            _exit(127);
+        }
+
+        char** argv = make_argv(cmd2.args);
+        execv(exe_path, argv);
+        perror("execv cmd2");
+        free_argv(argv);
+        _exit(127);
+    }
+
+    close(fd[0]);
+    close(fd[1]);
+
+    if (!background) {
+        int status1, status2;
+        waitpid(pid1, &status1, 0);
+        waitpid(pid2, &status2, 0);
+    } else {
+        add_bgjob(pid1, orig_cmdline + " (pipe parte 1)");
+        add_bgjob(pid2, orig_cmdline + " (pipe parte 2)");
+        cout << "[BG] Pipe en background: pids " << pid1 << " y " << pid2 << "\n";
+    }
+
+    return 0;
+}
+
+
+
+
 // ================= Función principal =================
 int main() {
     setup_signal_handlers();
@@ -295,15 +471,28 @@ int main() {
     while (true) {
         cout << "mini-shell> ";
         if (!getline(cin, line)) break;
+    
         if (line.empty()) continue;
+
+        command_history.push_back(line);
+
+        for (auto &a : aliases) {
+            size_t pos = line.find(a.first);
+            if (pos != string::npos && (pos == 0 || isspace(line[pos - 1])))
+                line.replace(pos, a.first.length(), a.second);
+        }
 
         ParsedLine pl = parse_line(line);
         if (pl.cmds.empty()) continue;
 
-        if (pl.cmds.size() == 1)
+        if (pl.cmds.size() == 1) {
             execute_single(pl.cmds[0], pl.background, line);
-        else
-            cerr << "Solo se admite una tubería por ahora.\n";
+        } else if (pl.cmds.size() == 2) {
+            execute_pipe(pl.cmds[0], pl.cmds[1], pl.background, line);
+        } else {
+            cerr << "Solo se admite una tubería simple (cmd1 | cmd2).\n";
+        }
+
     }
 
     return 0;
